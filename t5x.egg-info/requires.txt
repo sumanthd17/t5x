@@ -1,0 +1,27 @@
+absl-py
+cached_property
+clu@ git+https://github.com/google/CommonLoopUtils#egg=clu
+flax@ git+https://github.com/google/flax#egg=flax
+gin-config
+jax>=0.2.27
+jaxlib>=0.1.76
+jestimator
+numpy
+orbax@ git+https://github.com/google/orbax#egg=orbax
+seqio@ git+https://github.com/google/seqio#egg=seqio
+t5
+tensorflow-cpu
+tensorstore>=0.1.20
+
+[gcp]
+gevent
+google-api-python-client
+google-compute-engine
+google-cloud-storage
+oauth2client
+
+[test]
+pytest
+
+[tpu]
+jax[tpu]>=0.2.27

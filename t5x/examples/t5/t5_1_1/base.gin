@@ -18,7 +18,8 @@ DROPOUT_RATE = %gin.REQUIRED
 
 # Vocabulary (shared by encoder and decoder)
 VOCABULARY = @seqio.SentencePieceVocabulary()
-seqio.SentencePieceVocabulary.sentencepiece_model_file = "gs://t5-data/vocabs/cc_all.32000.100extra/sentencepiece.model"
+# seqio.SentencePieceVocabulary.sentencepiece_model_file = "gs://t5-data/vocabs/cc_all.32000.100extra/sentencepiece.model"
+seqio.SentencePieceVocabulary.sentencepiece_model_file = "/home/sumanth/t5-tokenizer/updatedspm128k.model"
 
 # ------------------- Optimizer ------------------------------------------------
 # `learning_rate` is set by `Trainer.learning_rate_fn`.
@@ -42,7 +43,7 @@ models.EncoderDecoderModel:
 # ------------------- Network specification ------------------------------------
 network.Transformer.config = @network.T5Config()
 network.T5Config:
-  vocab_size = 32128  # vocab size rounded to a multiple of 128 for TPU efficiency
+  vocab_size = 128128  # vocab size rounded to a multiple of 128 for TPU efficiency
   dtype = 'bfloat16'
   emb_dim = 768
   num_heads = 12

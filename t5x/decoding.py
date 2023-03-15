@@ -26,7 +26,8 @@ import numpy as np
 
 from t5x import binary_search
 
-PyTreeDef = type(jax.tree_util.tree_structure(None))
+PyTree = Any
+PyTreeDef = jax.tree_util.PyTreeDef
 
 # Constants
 # "Effective negative infinity" constant for masking in beam search.
@@ -46,10 +47,12 @@ class DecodingState:
   Note that we use a different class than `SamplingLoopState` or `Beamstate` to
   decouple the concerns of what data is useful for the loop vs. what the
   sampling method needs.
+  Decodes for a given batch entry are flattened in a column-major way so that
+  decodes from the same batch entry are grouped together.
 
   Attributes:
-    cur_index: [batch_size] array position of the sampling loop in the length
-      dimension.
+    cur_index: [batch_size * num_decodes] array position of the sampling loop in
+      the length dimension.
     sequences: [batch_size * num_decodes, max_decode_len] array of current
       sampled sequence prefixes.
     cur_token: [batch_size * num_decodes] single timestep slice containing
@@ -62,9 +65,9 @@ class DecodingState:
   cache: Mapping[str, jnp.ndarray]
 
 
-#------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 # Temperature Sampling
-#------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 
 
 @flax.struct.dataclass
@@ -72,17 +75,19 @@ class SamplingLoopState:
   """Holds sampling state data.
 
   Attributes:
-    cur_index: [batch_size] array position of the sampling loop in the length
-      dimension.
+    step: Scalar decoding step count. Starts from zero.
+    cur_index: [batch_size * num_decodes] array position of the sampling loop in
+      the length dimension.
     sequences: [batch_size * num_decodes, max_decode_len] array of current
       sampled sequence prefixes.
     cache: any mapping of arrays, e.g. flax attention cache.
-    cur_token: [batch_size, num_decodes] single timestep slice containing
+    cur_token: [batch_size * num_decodes] single timestep slice containing
       current tokens.
-    ended: [batch_size, num_decodes] binary array marking completed sequences.
+    ended: [batch_size * num_decodes] binary array marking completed sequences.
     rng: Jax PRNGKey
-    log_prob: [batch_size, num_decodes] array of log probs for each sequence.
+    log_prob: [batch_size * num_decodes] array of log probs for each sequence.
   """
+  step: jnp.ndarray
   cur_index: jnp.ndarray
   sequences: jnp.ndarray
   cache: Mapping[str, jnp.ndarray]
@@ -100,11 +105,16 @@ def _is_tracer(value: Any):
   return isinstance(value, jax.core.Tracer)
 
 
+StateCallbackFn = Callable[[SamplingLoopState], SamplingLoopState]
+LogitCallbackFn = Callable[[jnp.ndarray, SamplingLoopState], jnp.ndarray]
+
+
 def temperature_sample(
     inputs: jnp.ndarray,
     cache: Mapping[str, jnp.ndarray],
-    tokens_to_logits: Callable[[DecodingState],
-                               Tuple[jnp.ndarray, Mapping[str, jnp.ndarray]]],
+    tokens_to_logits: Callable[
+        [DecodingState], Tuple[jnp.ndarray, Mapping[str, jnp.ndarray]]
+    ],
     eos_id: int,
     decode_rng: Optional[jnp.ndarray] = None,
     num_decodes: int = 1,
@@ -116,10 +126,8 @@ def temperature_sample(
     max_decode_steps: Optional[Union[int, jnp.ndarray]] = None,
     max_decode_steps_hard_limit: Optional[int] = None,
     rescale_log_probs: bool = True,
-    state_callback_fn: Optional[Callable[[SamplingLoopState],
-                                         SamplingLoopState]] = None,
-    logit_callback_fn: Optional[Callable[[jnp.ndarray, SamplingLoopState],
-                                         jnp.ndarray]] = None
+    state_callback_fn: Optional[StateCallbackFn] = None,
+    logit_callback_fn: Optional[LogitCallbackFn] = None,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
   """Temperature sampling for language model generation.
 
@@ -394,8 +402,9 @@ def temperature_sample(
 def _temperature_sample_single_trial(
     inputs: jnp.ndarray,
     cache: Mapping[str, jnp.ndarray],
-    tokens_to_logits: Callable[[DecodingState],
-                               Tuple[jnp.ndarray, Mapping[str, jnp.ndarray]]],
+    tokens_to_logits: Callable[
+        [DecodingState], Tuple[jnp.ndarray, Mapping[str, jnp.ndarray]]
+    ],
     eos_id: int,
     prng_key: jnp.ndarray,
     num_decodes: int = 1,
@@ -405,10 +414,8 @@ def _temperature_sample_single_trial(
     initial_index: Optional[jnp.ndarray] = None,
     max_decode_steps: Optional[Union[int, jnp.ndarray]] = None,
     rescale_log_probs: bool = True,
-    state_callback_fn: Optional[Callable[[SamplingLoopState],
-                                         SamplingLoopState]] = None,
-    logit_callback_fn: Optional[Callable[[jnp.ndarray, SamplingLoopState],
-                                         jnp.ndarray]] = None
+    state_callback_fn: Optional[StateCallbackFn] = None,
+    logit_callback_fn: Optional[LogitCallbackFn] = None,
 ) -> jnp.ndarray:
   """A helper function for `temperature_sample`."""
 
@@ -455,6 +462,7 @@ def _temperature_sample_single_trial(
   temperature = jnp.asarray(temperature)
 
   # Initialize sampling loop state.
+  step = jnp.zeros((), dtype=jnp.int32)
   # initial loop PRNGKey
   rng0 = prng_key
   # the per batch-item holding current token in loop.
@@ -476,8 +484,9 @@ def _temperature_sample_single_trial(
   # as well as the generated output of newly sampled tokens.
   sequences0 = expanded_prompt_inputs
   log_prob0 = jnp.zeros((batch_size,), dtype=jnp.float32)
-  sampling_loop_init_state = SamplingLoopState(i0, sequences0, cache, token0,
-                                               ended0, rng0, log_prob0)
+  sampling_loop_init_state = SamplingLoopState(
+      step, i0, sequences0, cache, token0, ended0, rng0, log_prob0
+  )
   # Initial eos count to be used to determine whether eos is "generated". Many
   # inputs follow the format bos, inputs..., eos, targets..., eos. By counting
   # the number of eos tokens we can detect when a new one is added, instead of
@@ -516,12 +525,12 @@ def _temperature_sample_single_trial(
     def sample_logits_with_nonzero_temperature(logits, temperature):
       scaled_logits = logits / jnp.maximum(temperature, MIN_TEMPERATURE)
       if topk:
-        scaled_logits = binary_search.topk_mask(scaled_logits, topk, NEG_INF)
+        scaled_logits = binary_search.topk_mask(scaled_logits, topk, NEG_INF)  # pytype: disable=wrong-arg-types  # jax-ndarray
 
       # When topp is dynamic, we always use it since we cannot check
       # non-zeroness (but it will have no effect if topp is 0.0).
       if _is_tracer(topp) or topp:
-        scaled_logits = binary_search.topp_mask(scaled_logits, topp, NEG_INF)
+        scaled_logits = binary_search.topp_mask(scaled_logits, topp, NEG_INF)  # pytype: disable=wrong-arg-types  # jax-ndarray
 
       # [batch]
       next_token = random.categorical(rng1, scaled_logits).astype(jnp.int32)
@@ -642,24 +651,35 @@ def _temperature_sample_single_trial(
     ended = state.ended | has_additional_eos | jnp.expand_dims(
         i >= max_decode_len - 1, axis=1)
 
-    return SamplingLoopState(i + 1, new_sequences, new_cache,
-                             next_token_or_endpad, ended, rng2, next_log_prob)
+    return SamplingLoopState(
+        state.step + 1,
+        i + 1,
+        new_sequences,
+        new_cache,
+        next_token_or_endpad,
+        ended,
+        rng2,
+        next_log_prob,
+    )
 
   # Run sampling loop and collect final state.
   final_state = lax.while_loop(sampling_loop_cond_fn, sampling_loop_body_fn,
                                sampling_loop_init_state)
+
+  if state_callback_fn is not None:
+    final_state = state_callback_fn(final_state)
 
   # Pick part of the state corresponding to the sampled sequences.
   final_sequences = final_state.sequences
   log_prob = final_state.log_prob
   # Drop the first position because they are dummy bos tokens. Drop the new
   # garbage collection token at the end too.
-  return final_sequences[:, 1:-1], log_prob
+  return final_sequences[:, 1:-1], log_prob  # pytype: disable=bad-return-type  # jax-ndarray
 
 
-#------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 # BEAM Sampling
-#------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 
 
 def brevity_penalty(alpha: float, length: int) -> jnp.ndarray:
@@ -748,13 +768,15 @@ def flat_batch_beam_expand(x: jnp.ndarray,
   return flatten_beam_dim(add_beam_dim(x, beam_size, offset), offset)
 
 
-def cache_gather_beams(nested: PyTreeDef,
-                       beam_indices: jnp.ndarray,
-                       batch_size: int,
-                       old_beam_size: int,
-                       new_beam_size: int,
-                       one_hot: bool = True,
-                       offset: int = 0) -> jnp.ndarray:
+def cache_gather_beams(
+    nested: PyTree,
+    beam_indices: jnp.ndarray,
+    batch_size: int,
+    old_beam_size: int,
+    new_beam_size: int,
+    one_hot: bool = True,
+    offset: int = 0,
+) -> jnp.ndarray:
   """Gathers the cache beam slices indexed by beam_indices into new beam array.
 
   Args:
@@ -786,7 +808,7 @@ def cache_gather_beams(nested: PyTreeDef,
         return jnp.einsum('beo,lbo...->lbe...', oh_beam_indices,
                           x).astype(x.dtype)
 
-    return cache_map(gather_fn, nested)
+    return cache_map(gather_fn, nested)  # pytype: disable=bad-return-type  # jax-ndarray
 
   else:
     # True gather via fancy indexing.
@@ -805,12 +827,14 @@ def cache_gather_beams(nested: PyTreeDef,
     return cache_map(gather_fn, nested)
 
 
-def gather_beams(nested: PyTreeDef,
-                 beam_indices: jnp.ndarray,
-                 batch_size: int,
-                 old_beam_size: int,
-                 new_beam_size: int,
-                 one_hot: bool = True) -> jnp.ndarray:
+def gather_beams(
+    nested: PyTree,
+    beam_indices: jnp.ndarray,
+    batch_size: int,
+    old_beam_size: int,
+    new_beam_size: int,
+    one_hot: bool = True,
+) -> jnp.ndarray:
   """Gathers the beam slices indexed by beam_indices into new beam array.
 
   Args:
@@ -893,8 +917,12 @@ def top_k_two_stage(x, k):
     return lax.top_k(x, k)
 
 
-def gather_topk_beams(nested: PyTreeDef, score_or_log_prob: jnp.ndarray,
-                      batch_size: int, new_beam_size: int) -> jnp.ndarray:
+def gather_topk_beams(
+    nested: PyTree,
+    score_or_log_prob: jnp.ndarray,
+    batch_size: int,
+    new_beam_size: int,
+) -> jnp.ndarray:
   """Gathers the top-k beam slices given by score_or_log_prob array.
 
   Args:
@@ -921,18 +949,18 @@ def gather_topk_beams(nested: PyTreeDef, score_or_log_prob: jnp.ndarray,
 class BeamState:
   """Holds beam search state data."""
   # The position of the decoding loop in the length dimension.
-  cur_index: jnp.DeviceArray  # scalar int32: current decoded length index
+  cur_index: jax.Array  # scalar int32: current decoded length index
   # The active sequence log probabilities and finished sequence scores.
-  live_logprobs: jnp.DeviceArray  # float32: [batch_size, beam_size]
-  finished_scores: jnp.DeviceArray  # float32: [batch_size, beam_size]
+  live_logprobs: jax.Array  # float32: [batch_size, beam_size]
+  finished_scores: jax.Array  # float32: [batch_size, beam_size]
   # The current active-beam-searching and finished sequences.
-  live_seqs: jnp.DeviceArray  # int32: [batch_size, beam_size, max_decode_len]
-  finished_seqs: jnp.DeviceArray  # int32: [batch_size, beam_size,
+  live_seqs: jax.Array  # int32: [batch_size, beam_size, max_decode_len]
+  finished_seqs: jax.Array  # int32: [batch_size, beam_size,
   #                                         max_decode_len]
   # Records which of the 'finished_seqs' is occupied and not a filler slot.
-  finished_flags: jnp.DeviceArray  # bool: [batch_size, beam_size]
+  finished_flags: jax.Array  # bool: [batch_size, beam_size]
   # The current state of the autoregressive decoding caches.
-  cache: PyTreeDef  # Any pytree of arrays, e.g. flax attention Cache object
+  cache: PyTree  # Any pytree of arrays, e.g. flax attention Cache object
 
 
 def beam_init(batch_size: int,
@@ -1037,7 +1065,7 @@ def beam_search(inputs: jnp.ndarray,
 
     # If we're not at the max decode length, and the search hasn't terminated,
     # continue looping.
-    return not_at_end & (~search_terminated)
+    return not_at_end & (~search_terminated)  # pytype: disable=bad-return-type  # jax-devicearray
 
   def beam_search_loop_body_fn(state: BeamState) -> BeamState:
     """Beam search loop state update function."""
@@ -1163,7 +1191,7 @@ def beam_search(inputs: jnp.ndarray,
 
     # Update FINISHED (reached end of sentence) sequences:
     # Calculate new seq scores from log probabilities.
-    new_scores = topk_log_probs / brevity_penalty(alpha, state.cur_index + 1)
+    new_scores = topk_log_probs / brevity_penalty(alpha, state.cur_index + 1)  # pytype: disable=wrong-arg-types  # jax-devicearray
     # Mask out the still unfinished sequences by adding large negative value.
     # --> [batch, 2*beams]
     new_scores += (~newly_finished) * NEG_INF

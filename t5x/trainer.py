@@ -57,7 +57,7 @@ MetricMapSpec = Mapping[str, jax.ShapeDtypeStruct]
 MetricValueMapType = Mapping[str, clu.values.Value]
 ModelWeights = Any
 MutableMetricMapType = Dict[str, clu.metrics.Metric]
-PyTreeDef = type(jax.tree_util.tree_structure(None))
+PyTree = Any
 PartitionSpec = partitioning.PartitionSpec
 
 if TYPE_CHECKING:  # See b/163639353
@@ -228,7 +228,7 @@ class _AsyncTimer(object):
   def __del__(self):
     self.close()
 
-  def _get_completion_future(self, block_on: PyTreeDef = ()) -> TimeFuture:
+  def _get_completion_future(self, block_on: PyTree = ()) -> TimeFuture:
     """Returns Future containing time when `block_on` is ready."""
 
     def _get_completion_time():
@@ -246,11 +246,11 @@ class _AsyncTimer(object):
 
     return self._pool(_get_completion_time)()
 
-  def start(self, block_on: PyTreeDef = ()):
+  def start(self, block_on: PyTree = ()):
     """Starts timer after `block_on` is ready."""
     self._start_future = self._get_completion_future(block_on)
 
-  def stop(self, block_on: PyTreeDef = ()) -> TimeFuture:
+  def stop(self, block_on: PyTree = ()) -> TimeFuture:
     """Stops timer after `block_on` is ready, returning the duration."""
     if not self._start_future:
       raise ValueError("The timer hasn't been started.")
@@ -333,7 +333,7 @@ class MetricsManager(object):
     with self._writer_lock:
       self._writer.write_scalars(step, scalars)
 
-  def start_duration_timer(self, block_on: PyTreeDef = ()):
+  def start_duration_timer(self, block_on: PyTree = ()):
     """Starts the duration timer."""
     self._duration_timer.start(block_on=block_on)
 
@@ -375,7 +375,7 @@ class MetricsManager(object):
 
       # Ensure the metrics are not on device, which could lead to a deadlock.
       def _ensure_not_on_device(x):
-        assert not isinstance(x, jax.numpy.DeviceArray)
+        assert not isinstance(x, jax.Array)
 
       jax.tree_util.tree_map(_ensure_not_on_device, final_metrics)
       final_metrics = jax.tree_util.tree_map(utils.get_local_data,
@@ -475,7 +475,7 @@ class BaseTrainer(abc.ABC):
       return self._train_state
 
   @train_state.setter
-  def train_state(self, train_state: PyTreeDef):
+  def train_state(self, train_state: PyTree):
     with self._train_state_mutex:
       self._train_state = train_state
 
@@ -533,7 +533,7 @@ class BaseTrainer(abc.ABC):
     self._compiled_train_step = self._partitioner.compile(
         self._partitioned_train_step, self.train_state, batch)
     tock = time.time()
-    self.train_metrics_manager.write_scalar("timing/compilation_seconds",
+    self.train_metrics_manager.write_scalar("timing/compilation_seconds",  # pytype: disable=wrong-arg-types  # jax-ndarray
                                             tock - tick, self.train_state.step)
 
   def eval(
@@ -570,7 +570,7 @@ class BaseTrainer(abc.ABC):
           jnp.array(-1),
           "Eval step mismatch across hosts. Check for empty dataset shard.")
 
-      eval_summaries[iter_name] = mm.write_metrics_summary(
+      eval_summaries[iter_name] = mm.write_metrics_summary(  # pytype: disable=wrong-arg-types  # jax-ndarray
           metrics, train_state.step, num_steps)
 
     # TODO(adarob): Return futures.
@@ -608,7 +608,7 @@ class BaseTrainer(abc.ABC):
       self._compiled_eval_steps[eval_name] = self._compiled_eval_step_cache[
           cache_key]
       tock = time.time()
-      self.eval_metrics_managers[eval_name].write_scalar(
+      self.eval_metrics_managers[eval_name].write_scalar(  # pytype: disable=wrong-arg-types  # jax-ndarray
           "timing/compilation_seconds", tock - tick, self.train_state.step)
 
   @property
@@ -786,7 +786,7 @@ def apply_grads(
 def eval_step(model: models.BaseModel, train_state: train_state_lib.TrainState,
               batch: jnp.ndarray) -> MetricMapType:
   """Default evaluation step."""
-  _, metrics = model.eval_fn(train_state.params, batch)
+  _, metrics = model.eval_fn(train_state.params, batch)  # pytype: disable=wrong-arg-types  # jax-ndarray
   return metrics
 
 
@@ -880,7 +880,7 @@ class Trainer(BaseTrainer):
           train_state,
           batch,
           learning_rate=self._learning_rate_fn(train_state.step),
-          dropout_rng=self._get_step_rng(train_state.step),
+          dropout_rng=self._get_step_rng(train_state.step),  # pytype: disable=wrong-arg-types  # jax-ndarray
           model=self._model,
           num_microbatches=self._num_microbatches,
           weight_metrics_computer=self._weight_metrics_computer,

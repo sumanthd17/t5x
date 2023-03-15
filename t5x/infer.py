@@ -197,19 +197,21 @@ def merge_chunks_to_file(
   logging.info('Results written to %s.', output_path)
 
 
-_Inferences = Tuple[Sequence[Any], Mapping[str, Any]]
+Inferences = Tuple[Sequence[Any], Mapping[str, Any]]
+_Inferences = Inferences  # Backwards-compatible alias; used by Colabs
 
 
 def write_inferences_to_file(
     path: str,
-    inferences: _Inferences,
+    inferences: Inferences,
     task_ds: tf.data.Dataset,
     mode: str,
     vocabulary: Optional[seqio.Vocabulary] = None,
     json_encoder_cls: Type[json.JSONEncoder] = seqio.TensorAndNumpyEncoder,
     include_all_inputs: bool = False,
     input_fields_to_include: Optional[Sequence[str]] = None,
-    output_ids: bool = False) -> None:
+    output_ids: bool = False,
+) -> None:
   """Write model predictions, along with pretokenized inputs, to JSONL file.
 
   Args:
@@ -259,7 +261,11 @@ def write_inferences_to_file(
   with gfile.GFile(path, 'w') as f:
     for i, inp in task_ds.enumerate().as_numpy_iterator():
       predictions = all_predictions[i]
-      aux_values = {aux_field: v[i] for aux_field, v in all_aux_values.items()}
+      aux_values = jax.tree_map(
+          f=lambda v, i=i: v[i],
+          tree=all_aux_values,
+          is_leaf=lambda v: isinstance(v, (np.ndarray, list)),
+      )
 
       if include_all_inputs:
         inputs = inp
@@ -287,6 +293,8 @@ def write_inferences_to_file(
           json_dict['prediction_tokens'] = pred
       elif mode == 'score':
         json_dict['score'] = _json_compat(predictions)
+        if aux_values:
+          json_dict['aux'] = jax.tree_map(_json_compat, aux_values)
       elif mode == 'predict_with_aux':
         assert vocabulary is not None
         json_dict['prediction'] = _json_compat(
@@ -303,18 +311,21 @@ def write_inferences_to_file(
       f.write(json_str + '\n')
 
 
-WriteFn = Callable[[
-    str,
-    _Inferences,
-    tf.data.Dataset,
-    str,
-    Optional[seqio.Vocabulary],
-], None]
+WriteFn = Callable[
+    [
+        str,
+        Inferences,
+        tf.data.Dataset,
+        str,
+        Optional[seqio.Vocabulary],
+    ],
+    None,
+]
 
 MergeFn = Callable[[str, str, str, Optional[int]], None]
 
 
-def _extract_tokens_and_aux_values(inference_fn_outputs) -> _Inferences:
+def _extract_tokens_and_aux_values(inference_fn_outputs) -> Inferences:
   """Extracts tokens and aux scores from a cached dataset."""
   all_aux_values = {}
   if isinstance(inference_fn_outputs, tuple):
@@ -322,12 +333,13 @@ def _extract_tokens_and_aux_values(inference_fn_outputs) -> _Inferences:
     indices, tokens = zip(*indices_and_tokens)
 
     permutation = np.argsort(indices)
-
-    tokens = [tokens[permutation[i]] for i in range(len(permutation))]
-    for aux_keys, aux_values in all_aux_values.items():
-      all_aux_values[aux_keys] = [
-          aux_values[permutation[i]] for i in range(len(permutation))
-      ]
+    permute = lambda v: [v[permutation[i]] for i in range(len(permutation))]
+    tokens = permute(tokens)
+    all_aux_values = jax.tree_map(
+        f=permute,
+        tree=all_aux_values,
+        is_leaf=lambda v: isinstance(v, (np.ndarray, list)),
+    )
 
   else:
     indices_and_tokens = inference_fn_outputs
@@ -351,14 +363,18 @@ def infer(
     write_fn: WriteFn = write_inferences_to_file,
     checkpoint_ds_iter: bool = True,
     train_state_initializer_cls: Type[
-        utils.TrainStateInitializer] = utils.TrainStateInitializer,
+        utils.TrainStateInitializer
+    ] = utils.TrainStateInitializer,
     fallback_init_rng: Optional[int] = None,
     merge_fn: MergeFn = merge_chunks_to_file,
     summarize_config_fn: SummarizeConfigFn = gin_utils.summarize_gin_config,
     verify_matching_vocabs_fn: Optional[
-        Callable[[utils.DatasetConfig, models.BaseTransformerModel],
-                 None]] = utils.verify_matching_vocabs,
-    output_vocab_feature_name: str = 'targets'):
+        Callable[[utils.DatasetConfig, models.BaseTransformerModel], None]
+    ] = utils.verify_matching_vocabs,
+    output_vocab_feature_name: str = 'targets',
+    file_extension: str = 'jsonl',
+    keep_aux_as_numpy: bool = False,
+):
   """Infer function.
 
   Args:
@@ -384,8 +400,8 @@ def infer(
       `checkpoint_period` to enable faster restore. This must be disabled for
       certain datasets, for example since stateful iterators (e.g. from
       seqio.FunctionTask) cannot be checkpointed.
-    train_state_initializer_cls: t5x.utils.TrainStateInitializer class
-      for initializing partitioned TrainState from checkpoints or scratch.
+    train_state_initializer_cls: t5x.utils.TrainStateInitializer class for
+      initializing partitioned TrainState from checkpoints or scratch.
     fallback_init_rng: A random seed used for parameter initialization during
       model re-loading when utils.RestoreCheckpointConfig.fallback_to_scratch is
       set to True. If None, parameter initialization is not allowed during model
@@ -398,7 +414,11 @@ def infer(
       matches the model vocabulary. Should raise an exception on error.
     output_vocab_feature_name: The name of the feature corresponding to the
       output vocabulary.
+    file_extension: str. file extension used for file names
+    keep_aux_as_numpy: bool. whether to leave aux values as numpy arrays; can be
+      used to save space when saving bfloat16s
   """
+  jax.monitoring.record_event('/jax/t5x/infer/beacon')
   logging.info('Process ID: %d', jax.process_index())
 
   # Only allow `shard_id` 0 to write config summary, since the config summary
@@ -487,8 +507,11 @@ def infer(
           infer_step=infer_step,
           batch_size=batch_size,
           train_state_axes=train_state_initializer.train_state_axes,
-          partitioner=partitioner),
-      train_state=train_state)
+          partitioner=partitioner,
+          keep_aux_as_numpy=keep_aux_as_numpy,
+      ),
+      train_state=train_state,
+  )
 
   def infer_task(task: seqio.Task):
     tmp_dir = os.path.join(output_dir,
@@ -525,7 +548,9 @@ def infer(
         logging.info('Restoring input iterator from %s', ckpt_path)
         input_ckpt.read(ckpt_path).assert_consumed()
 
-    output_fname = f'{task.name}-{mode}.jsonl-{shard_id:05}-of-{num_shards:05}'
+    output_fname = (
+        f'{task.name}-{mode}.{file_extension}-{shard_id:05}-of-{num_shards:05}'
+    )
     if gfile.exists(os.path.join(output_dir, f'{output_fname}.COMPLETED')):
       logging.info(
           "File %s exists. Skipping inference for shard %d/%d of task '%s'",
@@ -534,10 +559,13 @@ def infer(
     logging.info("Starting inference loop for shard %d of %d of task '%s'.",
                  shard_id, num_shards, task.name)
 
-    def _write_chunk_and_canonicalize_ckpt(chunk: int, chunk_path: str,
-                                           inferences: _Inferences,
-                                           task_ds: tf.data.Dataset,
-                                           chunk_ckpt_path: Optional[str]):
+    def _write_chunk_and_canonicalize_ckpt(
+        chunk: int,
+        chunk_path: str,
+        inferences: Inferences,
+        task_ds: tf.data.Dataset,
+        chunk_ckpt_path: Optional[str],
+    ):
       write_tick = time.time()
       logging.info('Writing chunk %d results to %s', chunk, chunk_path)
       vocabulary = task.output_features[output_vocab_feature_name].vocabulary

@@ -14,7 +14,7 @@
 
 # pylint:disable=line-too-long
 # pyformat: disable
-r"""This script runs inference-evaluation on a T5X-compatible model.
+r"""Runs training- and inference-evaluation on a T5X-compatible model.
 
 """
 # pyformat: enable
@@ -22,7 +22,8 @@ r"""This script runs inference-evaluation on a T5X-compatible model.
 
 import functools
 import os
-from typing import Callable, Mapping, Optional, Sequence, Tuple, Type
+import re
+from typing import Callable, Collection, Mapping, Optional, Sequence, Set, Tuple, Type
 
 # pylint:disable=g-import-not-at-top
 # TODO(adarob): Re-enable once users are notified and tests are updated.
@@ -31,12 +32,16 @@ from absl import logging
 from clu import metric_writers
 import jax
 import seqio
+from t5x import checkpoints
 from t5x import gin_utils
 from t5x import models
 from t5x import partitioning
 from t5x import train_state as train_state_lib
+from t5x import trainer as trainer_lib
 from t5x import utils
+from tensorflow.io import gfile
 from typing_extensions import Protocol
+# pylint:enable=g-import-not-at-top
 
 # Automatically search for gin files relative to the T5X package.
 _DEFAULT_GIN_SEARCH_PATHS = [
@@ -167,6 +172,25 @@ class InferenceEvaluator:
     return all_metrics
 
 
+def _sorted_ckpt_paths(ckpt_paths: Collection[str]) -> Sequence[str]:
+  def _extract_ckpt_step(ckpt_path: str) -> int:
+    # Steps may be prefixed with "checkpoint_", "model.ckpt-" or nothing.
+    match = re.search(r'(checkpoint_|model.ckpt-)?(\d+)', ckpt_path)
+    if match is None:
+      raise ValueError(f'Invalid checkpoint path: {ckpt_path}')
+    assert match is not None
+    return int(match.group(2))
+
+  return sorted(ckpt_paths, key=_extract_ckpt_step)
+
+
+def _load_evaluated_ckpt_paths(eval_ckpt_path: str) -> Set[str]:
+  if not gfile.exists(eval_ckpt_path):
+    return set()
+  with gfile.GFile(eval_ckpt_path, 'r') as f:
+    return set(f.read().split())
+
+
 def evaluate(
     *,
     model: models.BaseTransformerModel,
@@ -174,11 +198,17 @@ def evaluate(
     restore_checkpoint_cfg: utils.RestoreCheckpointConfig,
     partitioner: partitioning.BasePartitioner,
     output_dir: str,
-    inference_evaluator_cls: utils.EvaluatorConstructor = seqio.Evaluator,
+    inference_evaluator_cls: Optional[
+        utils.EvaluatorConstructor
+    ] = seqio.Evaluator,
+    training_evaluator_cls: Optional[Type[trainer_lib.Trainer]] = None,
     summarize_config_fn: SummarizeConfigFn = gin_utils.summarize_gin_config,
     train_state_initializer_cls: Type[
-        utils.TrainStateInitializer] = utils.TrainStateInitializer,
-    fallback_init_rng: Optional[int] = None):
+        utils.TrainStateInitializer
+    ] = utils.TrainStateInitializer,
+    train_eval_get_dataset_fn: utils.GetEvalDatasetCallable = utils.get_training_eval_datasets,
+    fallback_init_rng: Optional[int] = None,
+):
   """Evaluation function.
 
   Args:
@@ -190,16 +220,22 @@ def evaluate(
     output_dir: Path to directory to write temporary files and final results.
     inference_evaluator_cls: seqio.Evaluator class to use for inference
       evaluation, potentially with bound configuration args.
+    training_evaluator_cls: an optional Trainer class to use for training
+      evaluation, potentially with bound configuration args.
     summarize_config_fn: A function that takes in the model directory, an
       optional SummaryWriter, and the step number, and writes a summary of the
       configuration. SummaryWriter will be None in most cases.
-    train_state_initializer_cls: t5x.utils.TrainStateInitializer class
-      for initializing partitioned TrainState from checkpoints or scratch.
+    train_state_initializer_cls: t5x.utils.TrainStateInitializer class for
+      initializing partitioned TrainState from checkpoints or scratch.
+    train_eval_get_dataset_fn: Optional callable use to get the train-eval
+      datasets based on the DatasetConfig and shard information. If missing, it
+      defaults to `utils.get_training_eval_datasets`.
     fallback_init_rng: A random seed used for parameter initialization during
       model re-loading when utils.RestoreCheckpointConfig.fallback_to_scratch is
       set to True. If None, parameter initialization is not allowed during model
       loading and having fallback_to_scratch enabled will result in an error.
   """
+  jax.monitoring.record_event('/jax/t5x/evaluate/beacon')
   logging.info('Process ID: %d', jax.process_index())
   if dataset_cfg.module:
     utils.import_module(dataset_cfg.module)
@@ -239,12 +275,73 @@ def evaluate(
                        train_state_initializer.global_train_state_shape,
                        partitioner)
 
+  if training_evaluator_cls:
+    data_layout = partitioner.get_data_layout(dataset_cfg.batch_size)
+    train_eval_datasets = train_eval_get_dataset_fn(  # pytype:disable=missing-parameter
+        dataset_cfg,
+        data_layout.shard_id,
+        data_layout.num_shards,
+        feature_converter_cls=model.FEATURE_CONVERTER_CLS,
+    )
+
+    train_evaluator = training_evaluator_cls(  # pytype:disable=wrong-arg-types
+        model=model,
+        train_state=None,  # Will replace later.
+        partitioner=partitioner,
+        train_state_axes=train_state_axes,
+        eval_names=train_eval_datasets.keys(),
+        summary_dir=output_dir,
+        rng=jax.random.PRNGKey(0),  # unused
+        learning_rate_fn=None,  # unused
+        num_microbatches=None,  # unused
+    )
+
+  def _maybe_run_train_eval(train_state: train_state_lib.TrainState):
+    if training_evaluator_cls:
+      train_evaluator.train_state = train_state
+      train_evaluator.eval(
+          {
+              task: ds.as_numpy_iterator()
+              for task, ds in train_eval_datasets.items()
+          }
+      )
+
   # Disable strictness since we are dropping the optimizer state.
   restore_checkpoint_cfg.strict = False
 
+  # Skip checkpoints that have already been evaluated.
+  eval_ckpt_path = os.path.join(
+      output_dir, f'eval.{dataset_cfg.mixture_or_task_name}.ckpt')
+  if restore_checkpoint_cfg.mode == 'all' and gfile.exists(eval_ckpt_path):
+    logging.info('Found evaluation checkpoint: %s', eval_ckpt_path)
+
+    ckpt_dirs = ([restore_checkpoint_cfg.path] if isinstance(
+        restore_checkpoint_cfg.path, str) else restore_checkpoint_cfg.path)
+    ckpt_paths = set()
+    for ckpt_dir in ckpt_dirs:
+      if not gfile.isdir(ckpt_dir):
+        raise ValueError(
+            f"Checkpoint path '{ckpt_dir}' must be a valid directory when "
+            "using restore mode 'all'."
+        )
+      ckpt_paths.update(
+          checkpoints.get_checkpoint_dir(ckpt_dir, step)
+          for step in checkpoints.all_steps(ckpt_dir))
+
+    evaluated_ckpt_paths = _load_evaluated_ckpt_paths(eval_ckpt_path)
+
+    logging.info(
+        'Skipping evaluated checkpoints:\n %s',
+        '\n '.join(_sorted_ckpt_paths(ckpt_paths & evaluated_ckpt_paths)),
+    )
+    restore_checkpoint_cfg.mode = 'specific'
+    restore_checkpoint_cfg.path = _sorted_ckpt_paths(
+        ckpt_paths - evaluated_ckpt_paths
+    )
+
   if fallback_init_rng is not None:
     fallback_init_rng = jax.random.PRNGKey(fallback_init_rng)
-  for train_state in train_state_initializer.from_checkpoints(
+  for train_state, ckpt_path in train_state_initializer.from_checkpoints(
       [restore_checkpoint_cfg], init_rng=fallback_init_rng):
 
     # ----------------------------------------------------------------------------
@@ -253,18 +350,27 @@ def evaluate(
 
     # Run final evaluation (with decoding) on the full eval dataset.
     host_step = int(utils.get_local_data(train_state.step))
+    _maybe_run_train_eval(train_state)
     all_metrics = evaluator.evaluate(train_state, train_state_axes)
     all_metrics.result()  # Ensure metrics are finished being computed.
     # Wait until computations are done before continuing.
     utils.sync_global_devices(f'step_{host_step}:complete')
+    if jax.process_index() == 0:
+      # Read/write/replace rather than append to avoid filesystem issue.
+      evaluated_ckpt_paths = _load_evaluated_ckpt_paths(eval_ckpt_path)
+      evaluated_ckpt_paths.add(ckpt_path)
+      with gfile.GFile(eval_ckpt_path, 'w') as f:
+        f.write('\n'.join(_sorted_ckpt_paths(evaluated_ckpt_paths)))
 
   logging.info('Finished.')
 
 
 if __name__ == '__main__':
+  # pylint:disable=g-import-not-at-top
   from absl import app
   from absl import flags
   import gin
+  # pylint:enable=g-import-not-at-top
 
   FLAGS = flags.FLAGS
 

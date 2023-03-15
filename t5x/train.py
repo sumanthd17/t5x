@@ -32,10 +32,11 @@ os.environ['FLAX_PROFILE'] = 'true'
 os.environ['FLAX_LAZY_RNG'] = 'no'
 from absl import logging
 from clu import metric_writers
+import fiddle as fdl
+from fiddle import absl_flags
 import jax
 from jax import random
 from jax.experimental import multihost_utils
-from jax.experimental.global_device_array import GlobalDeviceArray
 import jax.numpy as jnp
 import numpy as np
 import seqio
@@ -47,21 +48,19 @@ from t5x import train_state as train_state_lib
 from t5x import trainer as trainer_lib
 from t5x import utils
 import tensorflow as tf
+# pylint:enable=g-import-not-at-top
 
-
-# OOM fix. Prevents TF from seeing GPUs to stop conflict with JAX.
-tf.config.experimental.set_visible_devices([], 'GPU')
 
 # Automatically search for gin files relative to the T5X package.
 _DEFAULT_GIN_SEARCH_PATHS = [
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ]
-PyTreeDef = type(jax.tree_util.tree_structure(None))
 P = partitioning.PartitionSpec
 # Special key that used to distinguish train metrics.
 TRAIN_METRIC_KEY = 'train'
 # String keys that is acceptable from config.
 _ACTION_KEYS = frozenset(trainer_lib.ActionMode.__members__.keys())
+_IMPORT_TIME = time.time()
 
 
 def run_actions(
@@ -110,23 +109,24 @@ def train(
     stats_period: Optional[int] = None,
     random_seed: Optional[int],
     use_hardware_rng: bool = False,
-    summarize_config_fn: Callable[[str, metric_writers.MetricWriter, int],
-                                  None],
+    summarize_config_fn: Callable[
+        [str, metric_writers.MetricWriter, int], None
+    ],
     inference_evaluator_cls: utils.EvaluatorConstructor = seqio.Evaluator,
     get_dataset_fn: utils.GetDatasetCallable = utils.get_dataset,
     concurrent_metrics: bool = True,
     actions: Optional[Mapping[str, Sequence[trainer_lib.BaseAction]]] = None,
-    train_eval_get_dataset_fn: utils.GetEvalDatasetCallable = utils
-    .get_training_eval_datasets,
+    train_eval_get_dataset_fn: utils.GetEvalDatasetCallable = utils.get_training_eval_datasets,
     run_eval_before_training: bool = False,
     train_state_initializer_cls: Type[
-        utils.TrainStateInitializer] = utils.TrainStateInitializer,
+        utils.TrainStateInitializer
+    ] = utils.TrainStateInitializer,
     use_gda: bool = True,
-    use_jax_array: bool = False,
+    use_jax_array: bool = True,
     use_orbax: bool = False,
     verify_matching_vocabs_fn: Optional[
-        Callable[[utils.DatasetConfig, models.BaseTransformerModel],
-                 None]] = utils.verify_matching_vocabs,
+        Callable[[utils.DatasetConfig, models.BaseTransformerModel], None]
+    ] = utils.verify_matching_vocabs,
     gc_period: int = 0,
 ) -> Tuple[int, train_state_lib.TrainState]:
   """Train function.
@@ -183,9 +183,10 @@ def train(
       eval metrics before training begins.
     train_state_initializer_cls: t5x.utils.TrainStateInitializer class for
       initializing partitioned TrainState from checkpoints or scratch.
-    use_gda: if True, uses GlobalDeviceArray. Experimental feature.
+    use_gda: if True, uses jax.Array. Experimental feature.
     use_jax_array: if True, uses jax.Array if use_gda is also True. Experimental
-      feature.
+      feature. Since GlobalDeviceArray is deprecated, this is ignored, as
+      jax.Array must always be used.
     use_orbax: if True, uses Orbax for checkpointing. Experimental feature.
     verify_matching_vocabs_fn: Function to validate whether the task vocabulary
       matches the model vocabulary. Should raise an exception on error.
@@ -195,11 +196,12 @@ def train(
   Returns:
     The tuple of (last_step, last_train_state).
   """
+  jax.monitoring.record_event('/jax/t5x/train/beacon')
   logging.info('Process ID: %d', jax.process_index())
   tf.io.gfile.makedirs(model_dir)
 
   if use_gda:
-    logging.info('GlobalDeviceArray enabled.')
+    logging.info('jax.Array enabled.')
   else:
     warnings.warn(
         '`use_gda=False` is deprecated and will be removed on Feb-01-23.'
@@ -209,13 +211,27 @@ def train(
   if use_gda:
     if use_jax_array:
       jax.config.update('jax_array', True)
-    else:
-      jax.config.update('jax_parallel_functions_output_gda', True)
 
   if use_orbax:
     logging.info('Checkpointing with Orbax enabled.')
     if not use_gda:
       raise ValueError('Must set of `use_gda` if `use_orbax` is enabled.')
+    if (
+        checkpoint_cfg.save
+        and isinstance(
+            checkpoint_cfg.save.checkpointer_cls, pw_checkpoints.Checkpointer
+        )
+    ) or (
+        checkpoint_cfg.restore
+        and isinstance(
+            checkpoint_cfg.restore.checkpointer_cls, pw_checkpoints.Checkpointer
+        )
+    ):
+      warnings.warn(
+          'Requested use_orbax with Pathways checkpointing, which is currently'
+          ' unsupported. Setting use_orbax=False.'
+      )
+      use_orbax = False
 
   # Each "epoch" of the training loop should be the min of the eval period,
   # checkpoint period or the full training.
@@ -236,7 +252,8 @@ def train(
     raise ValueError(
         f'Checkpoint period ({checkpoint_period}), eval '
         f'period ({eval_period}), and GC period ({gc_period}) must all be '
-        f'multiples of eachother.')
+        'multiples of each other.'
+    )
 
   if use_hardware_rng or random_seed is None:
     logging.info(
@@ -373,10 +390,11 @@ def train(
       checkpoint_manager = utils.create_checkpoint_manager(
           save_cfg=checkpoint_cfg.save,
           restore_cfg=valid_restore_cfg,
-          train_state_shape=train_state_initializer.global_train_state_shape,
+          train_state=train_state_initializer.global_train_state_shape,
           partitioner=partitioner,
           ds_iter=train_iter,
-          model_dir=model_dir)
+          model_dir=model_dir,
+      )
       train_state = utils.restore(
           checkpoint_manager, restore_paths, valid_restore_cfg,
           utils.get_fallback_state(valid_restore_cfg, _init, init_rng))
@@ -417,7 +435,7 @@ def train(
   # Trainer
   # ---------------------------------------------------------------------------
 
-  trainer: trainer_lib.BaseTrainer = trainer_cls(
+  trainer: trainer_lib.BaseTrainer = trainer_cls(  # pytype: disable=wrong-arg-types
       model=model,
       train_state=train_state,
       partitioner=partitioner,
@@ -447,7 +465,7 @@ def train(
         log_dir=model_dir,
         verify_matching_vocabs_fn=verify_matching_vocabs_fn)
     if not evaluator.eval_tasks:
-      # Skip evaluaton.
+      # Skip evaluation.
       evaluator = None
 
   if actions is None:
@@ -475,7 +493,7 @@ def train(
   def _run_training_eval(first_run: bool = False):
     if first_run:
       logging.info('Compiling training eval loop.')
-      trainer.compile_eval({
+      trainer.compile_eval({  # pytype: disable=wrong-arg-types  # jax-ndarray
           task: utils.get_zeros_batch_like_dataset(ds)
           for task, ds in train_eval_datasets.items()
       })
@@ -485,7 +503,7 @@ def train(
         for task, ds in train_eval_datasets.items()
     }
     eval_summaries = trainer.eval(eval_batch_iters)
-    trainer.stop_training = run_actions(trainer_lib.ActionMode.TRAIN_EVAL,
+    trainer.stop_training = run_actions(trainer_lib.ActionMode.TRAIN_EVAL,  # pytype: disable=wrong-arg-types  # jax-ndarray
                                         actions, trainer.train_state,
                                         eval_summaries)
 
@@ -522,11 +540,16 @@ def train(
     # checkpoint if a checkpoint does not already exist for that step. This is
     # because Orbax will error out if we try to save a checkpoint that already
     # exists.
-    if not use_orbax or (use_orbax and trainer.train_state.step
-                         not in checkpoint_manager.all_steps()):
+    if not use_orbax or (
+        use_orbax
+        and utils.get_local_data(trainer.train_state.step)
+        not in checkpoint_manager.all_steps()
+    ):
       logging.info('Saving checkpoint before the training loop starts.')
-      checkpoint_manager.save(trainer.train_state,
-                              checkpoint_cfg.save.state_transformation_fns)
+      checkpoint_manager.save(
+          trainer.train_state,
+          checkpoint_cfg.save.state_transformation_fns,
+      )
 
   # If we take manual control of the garbage collector, we need to disable it
   # before starting training.
@@ -574,9 +597,13 @@ def train(
 
   def _as_gda(spec):
     dummy = np.ones((data_layout.batch_size, *spec.shape[1:]), spec.dtype)
-    return GlobalDeviceArray.from_callback(dummy.shape, partitioner.mesh,
-                                           partitioner.data_partition_spec,
-                                           lambda idx: dummy[idx])
+    return jax.make_array_from_callback(
+        dummy.shape,
+        jax.sharding.NamedSharding(
+            partitioner.mesh, partitioner.data_partition_spec
+        ),
+        lambda idx: dummy[idx],
+    )
 
   # Construct dummy batch for compiling the model.
   if use_gda:
@@ -604,6 +631,9 @@ def train(
                              train_iter_warmup_tock - train_iter_warmup_tick,
                              host_step)
 
+  jax.monitoring.record_event_duration_secs(
+      '/jax/t5x/train/time_before_first_step_secs',
+      time.time() - _IMPORT_TIME)
 
   # Main Loop over "epochs".
   for epoch in range(first_epoch, num_epochs):
@@ -626,7 +656,8 @@ def train(
             logging.info('Saving a checkpoint before early stopping...')
             checkpoint_manager.save(
                 trainer.train_state,
-                checkpoint_cfg.save.state_transformation_fns)
+                checkpoint_cfg.save.state_transformation_fns,
+            )
           logging.info('Stopping training loop early since `stop_training` is '
                        'requested.')
           break
@@ -639,7 +670,7 @@ def train(
           # that the actions can be performed without special casing. The only
           # caveat is that train would need its own special `key` given no
           # `task` will be applied.
-          trainer.stop_training = run_actions(
+          trainer.stop_training = run_actions(  # pytype: disable=wrong-arg-types  # jax-ndarray
               trainer_lib.ActionMode.TRAIN, actions, trainer.train_state,
               {TRAIN_METRIC_KEY: train_summary.result()})
 
@@ -648,8 +679,10 @@ def train(
     except trainer_lib.PreemptionError as e:
       if checkpoint_period:
         logging.info('Saving emergency checkpoint.')
-        checkpoint_manager.save(trainer.train_state,
-                                checkpoint_cfg.save.state_transformation_fns)
+        checkpoint_manager.save(
+            trainer.train_state,
+            checkpoint_cfg.save.state_transformation_fns,
+        )
         logging.info('Saving emergency checkpoint done.')
       raise e
 
@@ -665,8 +698,10 @@ def train(
       train_summary.result()
       logging.info('Saving checkpoint.')
       checkpoint_tick = time.time()
-      checkpoint_manager.save(trainer.train_state,
-                              checkpoint_cfg.save.state_transformation_fns)
+      checkpoint_manager.save(
+          trainer.train_state,
+          checkpoint_cfg.save.state_transformation_fns,
+      )
       checkpoint_tock = time.time()
       train_metrics.write_scalar('timing/checkpoint_seconds',
                                  checkpoint_tock - checkpoint_tick, host_step)
@@ -753,7 +788,6 @@ if __name__ == '__main__':
   flags.DEFINE_integer('process_index', None, help='Index of this process.')
 
 
-
   def main(argv: Sequence[str]):
     """Wrapper for pdb post mortems."""
     _main(argv)
@@ -763,6 +797,18 @@ if __name__ == '__main__':
     if len(argv) > 1:
       raise app.UsageError('Too many command-line arguments.')
 
+    # OOM fix. Prevents TF from seeing GPUs to stop conflict with JAX.
+    # This must go after InitGoogle(), which is called by
+    # gin_utils.run(main).
+    tf.config.experimental.set_visible_devices([], 'GPU')
+
+
+    if FLAGS.fdl_config_file and FLAGS.gin_file:
+      raise ValueError(
+          'Must pass only one of `--fdl_config_file` or `--gin_file`. Got: '
+          f'--fdl_config_file={FLAGS.fdl_config_file} '
+          f'--gin_file={FLAGS.gin_file}.'
+      )
 
     if FLAGS.multiprocess_gpu:
       logging.info(
@@ -778,16 +824,25 @@ if __name__ == '__main__':
 
     seqio.add_global_cache_dirs(FLAGS.seqio_additional_cache_dirs)
 
-    # Create gin-configurable version of `train`.
-    train_using_gin = gin.configurable(train)
+    if FLAGS.fdl_config_file:
+      raise NotImplementedError('Fiddle support is not implemented yet')
+    else:
+      # Create gin-configurable version of `train`.
+      train_using_gin = gin.configurable(train)
 
-    gin_utils.parse_gin_flags(
-        # User-provided gin paths take precedence if relative paths conflict.
-        FLAGS.gin_search_paths + _DEFAULT_GIN_SEARCH_PATHS,
-        FLAGS.gin_file,
-        FLAGS.gin_bindings)
-    train_using_gin()
+      gin_utils.parse_gin_flags(
+          # User-provided gin paths take precedence if relative paths conflict.
+          FLAGS.gin_search_paths + _DEFAULT_GIN_SEARCH_PATHS,
+          FLAGS.gin_file,
+          FLAGS.gin_bindings,
+      )
+      train_using_gin()
     jax.effects_barrier()
 
 
-  gin_utils.run(main)
+  if FLAGS.fdl_config_file:
+    logging.info('Training using Fiddle.')
+    app.run(main, flags_parser=absl_flags.flags_parser)
+  else:
+    logging.info('Training using gin.')
+    gin_utils.run(main)

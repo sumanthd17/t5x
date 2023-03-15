@@ -20,7 +20,7 @@ from absl import logging
 import cached_property
 from flax import core as flax_core
 import jax
-from jax.experimental.maps import Mesh
+from jax.sharding import Mesh
 import numpy as np
 from t5x import adafactor
 from t5x import optimizers
@@ -32,7 +32,7 @@ DataLayout = base_partitioning.DataLayout
 FlaxOptimTrainState = train_state_lib.FlaxOptimTrainState
 HardwareMesh = base_partitioning.HardwareMesh
 InferenceState = train_state_lib.InferenceState
-JaxDevice = jax.lib.xla_client.Device
+JaxDevice = jax.Device
 LogicalAxisRules = base_partitioning.LogicalAxisRules
 PartitionSpec = base_partitioning.PartitionSpec
 Pytree = Any

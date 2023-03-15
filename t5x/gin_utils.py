@@ -71,7 +71,6 @@ def parse_gin_flags(gin_search_paths: Sequence[str],
   # We import t5.data here since it includes gin configurable functions commonly
   # used by task modules.
   # TODO(adarob): Strip gin from t5.data and remove this import.
-  import t5.data  # pylint:disable=unused-import,g-import-not-at-top
   # Register .gin file search paths with gin
   for gin_file_path in gin_search_paths:
     gin.add_config_file_search_path(gin_file_path)
@@ -102,7 +101,7 @@ def rewrite_gin_args(args: Sequence[str]) -> Sequence[str]:
     arg = arg[6:]
     name, value = arg.split('=', maxsplit=1)
     r_arg = f'--gin_bindings={name} = {value}'
-    print(f'Rewritten gin arg: {r_arg}')
+    logging.info('Rewritten gin arg: %s', r_arg)
     return r_arg
 
   return [_rewrite_gin_arg(arg) for arg in args]

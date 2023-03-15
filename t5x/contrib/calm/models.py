@@ -38,7 +38,7 @@ import typing_extensions
 
 Array = Union[np.ndarray, jnp.ndarray, jax.pxla.ShardedDeviceArray, tf.Tensor]
 MetricsMap = metrics_lib.MetricsMap
-PyTreeDef = type(jax.tree_util.tree_structure(None))
+PyTree = Any
 
 
 
@@ -166,7 +166,7 @@ class EncoderDecoderModel(models.EncoderDecoderModel):
         loss_normalizing_factor=loss_normalizing_factor,
     )
 
-  def get_pred_confidence(self,
+  def get_pred_confidence(self,  # pytype: disable=annotation-type-mismatch  # jax-ndarray
                           logits: jnp.ndarray = None,
                           prev_state: jnp.ndarray = None,
                           new_state: jnp.ndarray = None,
@@ -224,7 +224,7 @@ class EncoderDecoderModel(models.EncoderDecoderModel):
 
   def loss_fn_meta_cls(
       self,
-      params: PyTreeDef,
+      params: PyTree,
       batch: Mapping[str, jnp.ndarray],
       dropout_rng: jnp.ndarray,
   ) -> Tuple[jnp.ndarray, MetricsMap]:
@@ -316,7 +316,7 @@ class EncoderDecoderModel(models.EncoderDecoderModel):
 
   def loss_fn_meta_cls_geom_like(
       self,
-      params: PyTreeDef,
+      params: PyTree,
       batch: Mapping[str, jnp.ndarray],
       dropout_rng: jnp.ndarray,
   ) -> Tuple[jnp.ndarray, MetricsMap]:
@@ -381,7 +381,7 @@ class EncoderDecoderModel(models.EncoderDecoderModel):
 
     total_z_loss = 0.0  # hardcoded
 
-    metrics = self._compute_metrics(
+    metrics = self._compute_metrics(  # pytype: disable=wrong-arg-types  # jax-ndarray
         logits=all_logits[-1],
         targets=batch['decoder_target_tokens'],
         mask=weights,
@@ -411,7 +411,7 @@ class EncoderDecoderModel(models.EncoderDecoderModel):
 
   def loss_fn(
       self,
-      params: PyTreeDef,
+      params: PyTree,
       batch: Mapping[str, jnp.ndarray],
       dropout_rng: jnp.ndarray,
   ) -> Tuple[jnp.ndarray, MetricsMap]:
@@ -496,7 +496,7 @@ class EncoderDecoderModel(models.EncoderDecoderModel):
   def _compute_logits_from_slice_early_exit(
       self,
       decoding_state: calm_decoding.DecodingState,
-      params: PyTreeDef,
+      params: PyTree,
       encoded_inputs: jnp.ndarray,
       raw_inputs: jnp.ndarray,
       max_decode_length: int,
@@ -786,13 +786,13 @@ class EncoderDecoderModel(models.EncoderDecoderModel):
 
   def predict_batch_with_aux(
       self,
-      params: PyTreeDef,
+      params: PyTree,
       batch: Mapping[str, jnp.ndarray],
       rng: Optional[jax.random.KeyArray] = None,
       decoder_params: Optional[MutableMapping[str, Any]] = None,
       return_all_decodes: bool = False,
       num_decodes: int = 1,
-      prompt_with_targets: bool = False
+      prompt_with_targets: bool = False,
   ) -> Tuple[jnp.ndarray, Mapping[str, jnp.ndarray]]:
     """Predict with fast decoding beam search on a batch.
 
@@ -940,7 +940,7 @@ class EncoderDecoderModel(models.EncoderDecoderModel):
     # in increasing order of log-probability.
     # Return the highest scoring beam sequence.
     if return_all_decodes:
-      return decodes, {
+      return decodes, {  # pytype: disable=bad-return-type  # jax-ndarray
           'scores': scores,
           'exits': exits,
           'confidences': confidences

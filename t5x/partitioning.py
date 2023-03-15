@@ -28,18 +28,17 @@ import jax
 from jax import numpy as jnp
 from jax import random
 from jax.experimental import multihost_utils
-from jax.experimental import PartitionSpec
-from jax.experimental.maps import Mesh
 from jax.experimental.mesh_utils import create_hybrid_device_mesh
 from jax.experimental.pjit import pjit as jax_pjit
+from jax.sharding import Mesh
+from jax.sharding import PartitionSpec
 import numpy as np
 from t5x import train_state as train_state_lib
 
-JaxDevice = jax.lib.xla_client.Device
+JaxDevice = jax.Device
 TpuMesh = Tuple[int, int, int, int]  # (x, y, z, num_cores).
 OtherMesh = Tuple[int, int]
 HardwareMesh = Union[TpuMesh, OtherMesh]
-PyTreeDef = type(jax.tree_util.tree_structure(None))
 TrainState = train_state_lib.TrainState
 LogicalAxisRules = Sequence[Tuple[str, Optional[str]]]
 
@@ -118,8 +117,7 @@ def with_sharding_constraint(x, axis_resources):
 
 # pjit Mesh creation functions.
 # -----------------------------------------------------------------------------
-def bounds_from_last_device(
-    last_device: jax.lib.xla_client.Device) -> HardwareMesh:
+def bounds_from_last_device(last_device: jax.Device) -> HardwareMesh:
   """Get the bound from the given last device."""
   # Must be passed the device at the highest-coordinate corner of the
   # relevant mesh, which is a requirement we know is satisfied by the last
@@ -133,7 +131,7 @@ def bounds_from_last_device(
     return jax.host_count(), jax.local_device_count()
 
 
-def get_coords(device: jax.lib.xla_client.Device) -> HardwareMesh:
+def get_coords(device: jax.Device) -> HardwareMesh:
   """Returns the coordinates of the given device."""
   if hasattr(device, 'coords'):
     return (*device.coords, device.core_on_chip)
@@ -305,8 +303,7 @@ def get_mesh(model_parallel_submesh: HardwareMesh,
 
 def get_cpu_mesh() -> Mesh:
   """Trivial mesh for CPU Testing."""
-  devices = np.empty((jax.host_count(), jax.local_device_count()),
-                     dtype=np.object)
+  devices = np.empty((jax.host_count(), jax.local_device_count()), dtype=object)
   for device in jax.devices():
     devices[device.process_index, device.id % jax.local_device_count()] = device
   return Mesh(devices, ['data', 'model'])
@@ -620,9 +617,13 @@ class BasePartitioner(metaclass=abc.ABCMeta):
 
     if model_parallel_submesh is not None and len(model_parallel_submesh) != 4:
       logging.error(
-          '`model_parallel_submesh` must be either None or a 4-tuple. Got '
-          'Got `num_partitions=%s`. A ValueError will be raised beginning '
-          'March 1, 2022.', model_parallel_submesh)
+          (
+              '`model_parallel_submesh` must be either None or a 4-tuple. Got'
+              ' `model_parallel_submesh`=%s. A ValueError will be raised'
+              ' beginning March 1, 2022.'
+          ),
+          model_parallel_submesh,
+      )
 
     if bool(num_partitions) and bool(model_parallel_submesh):
       logging.error(
@@ -796,17 +797,17 @@ class PjittedFnWithContext(PartitionedCallable):
     self._mesh = partition_mesh
     self._logical_axis_rules = logical_axis_rules
 
-  def __call__(self, *args):
+  def __call__(self, *args, **kwargs):
     with Mesh(self._mesh.devices,
               self._mesh.axis_names), flax_partitioning.axis_rules(
                   self._logical_axis_rules):
-      return self._pjitted_fn(*args)
+      return self._pjitted_fn(*args, **kwargs)
 
-  def lower(self, *args):
+  def lower(self, *args, **kwargs):
     with Mesh(self._mesh.devices,
               self._mesh.axis_names), flax_partitioning.axis_rules(
                   self._logical_axis_rules):
-      return self._pjitted_fn.lower(*args)
+      return self._pjitted_fn.lower(*args, **kwargs)
 
 
 class BasePjitPartitioner(BasePartitioner):
